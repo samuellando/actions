@@ -4,7 +4,7 @@ name: Update infra image tag
 # image, then calls this workflow to bump the tag in the infra manifests
 # (Flux syncs the change to the cluster).
 #
-# Example caller:
+# Example caller (single image, backwards compatible):
 #   deploy:
 #     needs: build
 #     if: github.ref == 'refs/heads/main'
@@ -15,21 +15,43 @@ name: Update infra image tag
 #       infra_file: apps/homepage/kube_config.yml
 #     secrets:
 #       INFRA_PAT: ${{ secrets.INFRA_PAT }}
+#
+# Example caller (multiple images):
+#   deploy:
+#     needs: [build-a, build-b]
+#     if: github.ref == 'refs/heads/main'
+#     uses: samuellando/actions/.github/workflows/update-infra.yml@main
+#     with:
+#       updates: |
+#         [
+#           {"image": "ghcr.io/samuellando/app-a", "tag": "sha-aaaaaaa", "infra_file": "apps/app-a/kube_config.yml"},
+#           {"image": "ghcr.io/samuellando/app-b", "tag": "sha-bbbbbbb", "infra_file": "apps/app-b/kube_config.yml"}
+#         ]
+#     secrets:
+#       INFRA_PAT: ${{ secrets.INFRA_PAT }}
 
 on:
   workflow_call:
     inputs:
       image:
-        description: Full image name without tag (e.g. ghcr.io/samuellando/zelda-homepage)
-        required: true
+        description: Full image name without tag (e.g. ghcr.io/samuellando/zelda-homepage). Single-image mode.
+        required: false
+        default: ''
         type: string
       tag:
-        description: Image tag the project built and pushed (e.g. sha-74eb511)
-        required: true
+        description: Image tag the project built and pushed (e.g. sha-74eb511). Single-image mode.
+        required: false
+        default: ''
         type: string
       infra_file:
-        description: Manifest to bump in infra repo (e.g. apps/homepage/kube_config.yml)
-        required: true
+        description: Manifest to bump in infra repo (e.g. apps/homepage/kube_config.yml). Single-image mode.
+        required: false
+        default: ''
+        type: string
+      updates:
+        description: JSON array of {image, tag, infra_file} objects for multi-image updates. If set, single-image inputs are ignored.
+        required: false
+        default: ''
         type: string
       infra_repo:
         description: Infra repo to update (owner/repo)
@@ -60,16 +82,58 @@ jobs:
           IMAGE: ${{ inputs.image }}
           TAG: ${{ inputs.tag }}
           INFRA_FILE: ${{ inputs.infra_file }}
+          UPDATES: ${{ inputs.updates }}
         run: |
-          echo "Updating $INFRA_FILE to $IMAGE:$TAG"
-          sed -i -E "s|${IMAGE}:[^[:space:]\"']+|${IMAGE}:${TAG}|g" "$INFRA_FILE"
-          grep -n -F "$IMAGE:" "$INFRA_FILE"
+          # Build a newline-delimited list of "image|tag|file" entries.
+          # Prefers `updates` JSON array; falls back to single image/tag/infra_file.
+          ENTRIES=$(python3 -c '
+          import json, os, sys
+          updates_raw = os.environ.get("UPDATES", "").strip()
+          if updates_raw:
+              try:
+                  updates = json.loads(updates_raw)
+              except json.JSONDecodeError as e:
+                  print(f"::error::Invalid JSON in `updates` input: {e}", file=sys.stderr)
+                  sys.exit(1)
+              if not isinstance(updates, list) or not updates:
+                  print("::error::`updates` must be a non-empty JSON array", file=sys.stderr)
+                  sys.exit(1)
+              for u in updates:
+                  for k in ("image", "tag", "infra_file"):
+                      if not u.get(k):
+                          print(f"::error::Each entry in `updates` needs `{k}`: {u}", file=sys.stderr)
+                          sys.exit(1)
+                  print(f"{u[\"image\"]}|{u[\"tag\"]}|{u[\"infra_file\"]}")
+          else:
+              image = os.environ.get("IMAGE", "")
+              tag = os.environ.get("TAG", "")
+              infra_file = os.environ.get("INFRA_FILE", "")
+              if not image or not tag or not infra_file:
+                  print("::error::Provide either `updates` JSON or all of `image`, `tag`, `infra_file`", file=sys.stderr)
+                  sys.exit(1)
+              print(f"{image}|{tag}|{infra_file}")
+          ')
+          echo "$ENTRIES"
+
+          SUMMARY=""
+          while IFS='|' read -r IMAGE TAG INFRA_FILE; do
+            [ -z "$IMAGE" ] && continue
+            echo "Updating $INFRA_FILE to $IMAGE:$TAG"
+            # Escape regex metachars in image name so sed matches literally.
+            ESCAPED_IMAGE=$(printf '%s' "$IMAGE" | sed -e 's/[][\/.^$*+?{}()|]/\\&/g')
+            sed -i -E "s|${ESCAPED_IMAGE}:[^[:space:]\"']+|${IMAGE}:${TAG}|g" "$INFRA_FILE"
+            grep -n -F "$IMAGE:" "$INFRA_FILE"
+            git add "$INFRA_FILE"
+            SUMMARY="${SUMMARY}$(basename "$(dirname "$INFRA_FILE")") to $TAG, "
+          done <<< "$ENTRIES"
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$INFRA_FILE"
           if git diff --staged --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "Update $(basename "$(dirname "$INFRA_FILE")") to $TAG"
+            # Trim trailing ", " and keep subject line short.
+            SUMMARY=${SUMMARY%, }
+            git commit -m "Update ${SUMMARY:0:200}"
             git push
           fi
