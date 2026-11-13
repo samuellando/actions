@@ -20,6 +20,10 @@ on:
         description: Full image name without tag (e.g. ghcr.io/samuellando/readthis)
         required: true
         type: string
+      file:
+        description: The docerfile used to build the image
+        required: false
+        type: string
       context:
         description: Docker build context
         required: false
@@ -68,6 +72,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
